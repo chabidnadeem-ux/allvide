@@ -1,8 +1,8 @@
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
-import yt_dlp
+import requests
 import os
-import tempfile
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 CORS(app)
@@ -12,7 +12,7 @@ CORS(app)
 def home():
     return jsonify({
         "status": "VideoSave Backend Running",
-        "version": "2.0"
+        "version": "3.0"
     })
 
 
@@ -20,126 +20,74 @@ def home():
 def download_video():
     try:
         data = request.get_json(silent=True) or {}
+
         url = data.get("url", "").strip()
-        fmt = data.get("format", "auto").lower()
 
         if not url:
-            return jsonify({"error": "URL is required"}), 400
+            return jsonify({
+                "error": "URL is required"
+            }), 400
 
-        # MP3
-        if fmt == "mp3":
-            ydl_opts = {
-                "format": "ba/b",
-                "outtmpl": os.path.join(
-                    "%(tmpdir)s", "%(title)s.%(ext)s"
-                ),
-                "quiet": True,
-                "no_warnings": True,
-                "noplaylist": True,
-                "postprocessors": [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192",
-                    }
-                ],
+        parsed = urlparse(url)
+
+        if parsed.scheme not in ("http", "https"):
+            return jsonify({
+                "error": "Invalid URL"
+            }), 400
+
+        # Direct/public media URL only
+        response = requests.get(
+            url,
+            stream=True,
+            timeout=30,
+            headers={
+                "User-Agent": "Mozilla/5.0"
             }
+        )
 
-        # MP4 / Auto
-        else:
-            ydl_opts = {
-                # Flexible format selection.
-                # Do NOT force mp4-only formats.
-                "format": "bv*+ba/b",
-                "merge_output_format": "mp4",
-                "quiet": True,
-                "no_warnings": True,
-                "noplaylist": True,
-            }
+        response.raise_for_status()
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-
-            ydl_opts["outtmpl"] = os.path.join(
-                tmpdir, "%(title)s.%(ext)s"
+        content_type = (
+            response.headers.get(
+                "Content-Type",
+                "application/octet-stream"
             )
+            .split(";")[0]
+            .lower()
+        )
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+        allowed_types = (
+            "video/",
+            "audio/"
+        )
 
-                title = info.get("title") or "video"
+        if not content_type.startswith(allowed_types):
+            return jsonify({
+                "error": "This URL is not a direct audio/video file."
+            }), 400
 
-                # Find downloaded file
-                files = [
-                    os.path.join(tmpdir, f)
-                    for f in os.listdir(tmpdir)
-                    if os.path.isfile(os.path.join(tmpdir, f))
-                ]
+        filename = os.path.basename(parsed.path)
 
-                if not files:
-                    return jsonify({
-                        "error": "No downloaded file was created."
-                    }), 500
+        if not filename:
+            if content_type.startswith("audio/"):
+                filename = "VideoSave.mp3"
+            else:
+                filename = "VideoSave.mp4"
 
-                # Prefer requested extension
-                actual_file = None
+        return Response(
+            response.iter_content(chunk_size=1024 * 1024),
+            content_type=content_type,
+            headers={
+                "Content-Disposition":
+                    f'attachment; filename="{filename}"',
+                "Access-Control-Allow-Origin": "*"
+            }
+        )
 
-                if fmt == "mp3":
-                    for f in files:
-                        if f.lower().endswith(".mp3"):
-                            actual_file = f
-                            break
-                else:
-                    for f in files:
-                        if f.lower().endswith(".mp4"):
-                            actual_file = f
-                            break
-
-                if actual_file is None:
-                    actual_file = files[0]
-
-                extension = os.path.splitext(actual_file)[1].lower()
-
-                if extension == ".mp3":
-                    mime = "audio/mpeg"
-                elif extension == ".mp4":
-                    mime = "video/mp4"
-                elif extension == ".webm":
-                    mime = "video/webm"
-                elif extension == ".m4a":
-                    mime = "audio/mp4"
-                else:
-                    mime = "application/octet-stream"
-
-                safe_title = "".join(
-                    c for c in title
-                    if c.isalnum() or c in (" ", "-", "_")
-                ).strip()
-
-                if not safe_title:
-                    safe_title = "VideoSave"
-
-                filename = safe_title + extension
-
-                file_size = os.path.getsize(actual_file)
-
-                def generate():
-                    with open(actual_file, "rb") as file:
-                        while True:
-                            chunk = file.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            yield chunk
-
-                return Response(
-                    generate(),
-                    mimetype=mime,
-                    headers={
-                        "Content-Disposition":
-                            f'attachment; filename="{filename}"',
-                        "Content-Length": str(file_size),
-                        "Access-Control-Allow-Origin": "*",
-                    },
-                )
+    except requests.exceptions.RequestException as e:
+        return jsonify({
+            "error": f"Download failed: {str(e)}"
+        }), 500
 
     except Exception as e:
         return jsonify({
